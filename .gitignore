@@ -1,0 +1,6 @@
+.workbuddy/
+.clipboard-images/
+*.tmp*
+.tmp-*
+.DS_Store
+Thumbs.db
