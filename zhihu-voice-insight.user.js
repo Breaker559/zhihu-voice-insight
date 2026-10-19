@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         知乎发言画像 · 发言频率/字数标注与刷屏屏蔽
 // @namespace    zhihu-voice-insight
-// @version      2.6.0
+// @version      2.7.0
 // @description  在知乎答主头像/昵称下方直接插入一条发言画像：近 7/30 天条数、平均间隔、正文字数、最近发言列表；自动识别「几分钟内连发多条、一小时内刷屏、新号高产、短句灌水」，可按规则折叠或隐藏其回答；可选接 OpenAI 兼容接口做文本评估。
 // @author       WorkBuddy
 // @match        https://*.zhihu.com/*
@@ -27,6 +27,7 @@
     mode: 'inline',          // inline = 头像下方内联标注；hover = 悬停卡片；off = 关闭
     fetchLimit: 20,          // 抓取最近多少条用于统计（知乎单页上限 20）
     showLimit: 5,            // 展开后列出多少条
+    snipChars: 120,          // 每条发言摘录多少字（太长会 CSS 截成两行）
     includeArticles: true,   // 是否把「文章」计入发言
     cacheMinutes: 30,
     exactLength: false,      // true = 为最近几条单独请求正文取精确字数（更慢）
@@ -411,8 +412,18 @@
       }
     }
 
+    // 最近发言：额外带一段截断的正文摘录，完整正文不进缓存
+    var snipCap = (opts.snipChars === 0 || opts.snipChars === '0') ? 0 : (opts.snipChars || 120);
+    var recent = items.slice(0, opts.showLimit || 5).map(function (it) {
+      var c = Object.assign({}, it);
+      var raw = (it.raw || '').replace(/\s+/g, ' ').trim();
+      c.snip = snipCap > 0 ? raw.slice(0, snipCap) : '';
+      delete c.raw;
+      return c;
+    });
+
     return {
-      recent: items.slice(0, opts.showLimit || 5),
+      recent: recent,
       texts: texts,
       totalFetched: items.length,
       d7: inWindow(7), d30: inWindow(30),
@@ -509,13 +520,12 @@
             includeArticles: cfg.includeArticles,
             llm: cfg.llm.enabled,
             llmItems: cfg.llm.maxItems,
-            llmChars: cfg.llm.maxChars
+            llmChars: cfg.llm.maxChars,
+            snipChars: cfg.snipChars
           }),
           source: source,
           fetchedAt: Date.now()
         };
-        // 完整正文不进缓存，只留截断后的 texts
-        data.stats.recent.forEach(function (it) { delete it.raw; });
         if (cfg.exactLength) {
           return Promise.all(data.stats.recent.map(exactLength)).then(function () {
             data.stats.recent.forEach(function (it) {
@@ -599,8 +609,11 @@
     'border:1px solid #eef0f2;border-radius:7px;}',
     '.zvi-inline.is-open .zvi-detail{display:block;}',
     '.zvi-detail ul{list-style:none;margin:0;padding:0;}',
-    '.zvi-detail li{display:flex;align-items:baseline;gap:8px;padding:3px 0;font-size:12px;line-height:1.5;}',
+    '.zvi-detail li{display:block;padding:5px 0;}',
     '.zvi-detail li+li{border-top:1px solid #f3f5f7;}',
+    '.zvi-row{display:flex;align-items:baseline;gap:8px;}',
+    '.zvi-snip{margin:2px 0 0;color:#9aa0a6;font-size:11.5px;line-height:1.5;',
+    'display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;}',
     '.zvi-ttl{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;',
     'color:#2b2b2b;text-decoration:none;font-size:12.5px;}',
     '.zvi-ttl:hover{color:#0084ff;}',
@@ -899,10 +912,13 @@
         ' \u00b7 ' + (it.approx ? '\u7ea6' : '') + it.len + ' \u5b57' +
         (it.excerpt ? '\n' + it.excerpt : '');
       return '<li>' +
+        '<div class="zvi-row">' +
         '<a class="zvi-ttl" href="' + esc(it.url || '#') + '" target="_blank" rel="noopener" title="' + esc(tip) + '">' +
         esc(it.title) + '</a>' +
         '<span class="zvi-len">' + (it.approx ? '\u2248' : '') + it.len + '\u5b57</span>' +
         '<span class="zvi-time">' + esc(fmtShort(it.ts)) + '</span>' +
+        '</div>' +
+        (it.snip ? '<p class="zvi-snip">' + esc(it.snip) + '</p>' : '') +
         '</li>';
     }).join('');
 
@@ -1106,6 +1122,7 @@
       opt('hover', '\u60ac\u505c\u5361\u7247', cfg.mode) +
       opt('off', '\u5173\u95ed', cfg.mode) + '</select></div>' +
       '<div class="row"><label>\u5361\u7247\u5c55\u5f00\u6761\u6570</label><input type="number" min="1" max="20" data-k="showLimit" value="' + cfg.showLimit + '"></div>' +
+      '<div class="row"><label>\u53d1\u8a00\u6458\u5f55\u5b57\u6570</label><input type="number" min="0" max="600" step="20" data-k="snipChars" value="' + cfg.snipChars + '"></div>' +
       '<div class="row"><label>\u7edf\u8ba1\u6837\u672c\u6761\u6570</label><input type="number" min="5" max="20" data-k="fetchLimit" value="' + cfg.fetchLimit + '"></div>' +
       '<div class="row"><label>\u5b57\u6570\u53e3\u5f84</label><select data-k="countMode">' +
       opt('char', '\u5b57\u7b26\u6570\uff08\u4e2d\u6587\uff09', cfg.countMode) +
