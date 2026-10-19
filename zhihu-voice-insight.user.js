@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         知乎发言画像 · 发言频率/字数标注与刷屏屏蔽
 // @namespace    zhihu-voice-insight
-// @version      2.5.0
-// @description  在知乎答主头像/昵称下方直接插入一条发言画像：近 7/30 天条数、平均间隔、正文字数、最近发言列表；自动识别「几分钟内连发多条、一小时内刷屏、新号高产、短句灌水」，可按规则折叠或隐藏其回答。
+// @version      2.6.0
+// @description  在知乎答主头像/昵称下方直接插入一条发言画像：近 7/30 天条数、平均间隔、正文字数、最近发言列表；自动识别「几分钟内连发多条、一小时内刷屏、新号高产、短句灌水」，可按规则折叠或隐藏其回答；可选接 OpenAI 兼容接口做文本评估。
 // @author       WorkBuddy
 // @match        https://*.zhihu.com/*
 // @grant        GM_xmlhttpRequest
@@ -13,6 +13,7 @@
 // @connect      zhihu.com
 // @connect      zhuanlan.zhihu.com
 // @connect      api.zhihu.com
+// @connect      *
 // @run-at       document-idle
 // @noframes
 // ==/UserScript==
@@ -46,7 +47,20 @@
     },
     action: 'collapse',      // mark = 仅标记；collapse = 折叠；hide = 隐藏
     whitelist: [],           // 永不屏蔽
-    blocklist: []            // 手动屏蔽
+    blocklist: [],           // 手动屏蔽
+
+    // 文本评估：可选。填了兼容 OpenAI 格式的接口才启用（留空即完全不发外部请求）
+    llm: {
+      enabled: false,
+      baseUrl: '',           // 如 https://api.typesafe.ai/v1、https://openrouter.ai/api/v1、http://127.0.0.1:11434/v1
+      apiKey: '',
+      model: '',             // 如 jev-latest、qwen-plus、gpt-4o-mini
+      maxItems: 6,           // 取最近几条正文参与评估
+      maxChars: 600,         // 每条正文最多取多少字
+      onlySuspicious: true,  // 只在命中行为规则时才分析（省调用）
+      flagAt: 0.6,           // 合成分 ≥ 此值才显示红色标签
+      cacheDays: 7
+    }
   };
 
   var cfg = JSON.parse(JSON.stringify(DEFAULT_CFG));
@@ -54,6 +68,18 @@
   var CFG_KEY = 'zvi_cfg_v2';
   var CACHE_KEY = 'zvi_cache_v2';
   var LEN_KEY = 'zvi_len_v2';
+  var AI_KEY = 'zvi_ai_v1';
+
+  // 文本评估维度：值越大越可疑，权重之和为 1
+  var AI_DIMS = [
+    { k: 'templated', w: 0.22, name: '模板', desc: '模板化结构：总分总、并列要点罗列、结尾升华、整齐的小标题' },
+    { k: 'no_experience', w: 0.20, name: '无经历', desc: '缺少作者亲历的具体事件，没有我当年、我朋友、上周我去这类个人经历' },
+    { k: 'no_detail', w: 0.15, name: '缺细节', desc: '缺少具体时间、地点、数字、专有名词等可核验的细节' },
+    { k: 'low_density', w: 0.15, name: '套话', desc: '信息密度低，大量正确但无用的车轱辘话' },
+    { k: 'uniform_style', w: 0.13, name: '笔法一致', desc: '这几条之间写作风格高度一致，像出自同一套笔法而非自然波动' },
+    { k: 'hedging', w: 0.10, name: '两头说', desc: '通篇平衡中立、正反两面都说到、不做明确判断' },
+    { k: 'promotion', w: 0.05, name: '推广', desc: '含有推广、引流、品牌名、产品名称、引导关注或购买的内容' }
+  ];
 
   var cache = {};      // token -> { ts, data }
   var lenCache = {};   // answerId/articleId -> 字数
@@ -299,6 +325,7 @@
     return {
       kind: 'ans', id: String(a.id || ''), ts: ts,
       title: (a.question && (a.question.title || a.question.name)) || a.title || '\uff08\u65e0\u6807\u9898\uff09',
+      raw: stripHtml(a.content || ''),
       len: m.len, approx: m.approx,
       excerpt: plainText(a.excerpt || a.content || '', 70),
       voteup: num(a.voteup_count, a.voteupCount),
@@ -315,6 +342,7 @@
     return {
       kind: 'art', id: String(a.id || ''), ts: ts,
       title: a.title || '\uff08\u65e0\u6807\u9898\uff09',
+      raw: stripHtml(a.content || ''),
       len: m.len, approx: m.approx,
       excerpt: plainText(a.excerpt || a.content || '', 70),
       voteup: num(a.voteup_count, a.voteupCount),
@@ -373,8 +401,19 @@
     var totalPosts = (profile.answerCount || 0) + (profile.articleCount || 0);
     var perDay = (accountDays && accountDays > 0) ? totalPosts / accountDays : null;
 
+    // 供文本评估用的正文片段：每条截断保存，避免把全文塞进缓存
+    var texts = [];
+    if (opts.llm) {
+      var pick = opts.llmItems || 6, cap = opts.llmChars || 600;
+      for (var ti = 0; ti < items.length && texts.length < pick; ti++) {
+        var tx = (items[ti].raw || '').replace(/\s+/g, ' ').trim();
+        if (tx) texts.push(tx.slice(0, cap));
+      }
+    }
+
     return {
       recent: items.slice(0, opts.showLimit || 5),
+      texts: texts,
       totalFetched: items.length,
       d7: inWindow(7), d30: inWindow(30),
       burst: burst,
@@ -467,11 +506,16 @@
           profile: profile,
           stats: buildStats(profile, answers, articles, {
             showLimit: cfg.showLimit,
-            includeArticles: cfg.includeArticles
+            includeArticles: cfg.includeArticles,
+            llm: cfg.llm.enabled,
+            llmItems: cfg.llm.maxItems,
+            llmChars: cfg.llm.maxChars
           }),
           source: source,
           fetchedAt: Date.now()
         };
+        // 完整正文不进缓存，只留截断后的 texts
+        data.stats.recent.forEach(function (it) { delete it.raw; });
         if (cfg.exactLength) {
           return Promise.all(data.stats.recent.map(exactLength)).then(function () {
             data.stats.recent.forEach(function (it) {
@@ -538,6 +582,13 @@
     '.zvi-sep{color:#d5d8dc;}',
     '.zvi-tag{white-space:nowrap;}',
     '.zvi-chip{padding:0 5px;border-radius:3px;font-size:11px;line-height:15px;background:#fff1f0;color:#d4380d;white-space:nowrap;}',
+    '.zvi-ai{flex:0 0 auto;padding:0 5px;border-radius:3px;font-size:11px;line-height:15px;',
+    'background:#eef1f4;color:#6b7280;white-space:nowrap;font-variant-numeric:tabular-nums;}',
+    '.zvi-ai.is-hot{background:#ffe9de;color:#d4380d;}',
+    '.zvi-ai.is-loading{background:#eef1f4;color:#9aa0a6;}',
+    '.zvi-ai.is-err{background:#fdeaea;color:#a32d2d;}',
+    '.zvi-airow{color:#b6bbc1;font-size:11px;}',
+    '.zvi-airow.is-hot{color:#d4380d;}',
     '.zvi-act{margin-left:auto;display:flex;align-items:center;gap:6px;}',
     '.zvi-lnk{font:inherit;font-size:11.5px;color:#8590a6;background:none;border:none;padding:0;cursor:pointer;white-space:nowrap;}',
     '.zvi-lnk:hover{color:#0084ff;}',
@@ -582,10 +633,150 @@
     '#zvi-panel input[type=number]{width:56px;}',
     '#zvi-panel select,#zvi-panel input{padding:2px 4px;border:1px solid #ddd;border-radius:4px;font-size:12px;}',
     '#zvi-panel .hint{color:#999;font-size:11px;line-height:1.5;margin:6px 0 0;}',
+    '#zvi-panel .hint:empty{display:none;}',
     '#zvi-panel .grp{border-top:1px solid #f0f0f0;margin-top:10px;padding-top:10px;}',
     '#zvi-panel button{padding:4px 10px;border:1px solid #ddd;background:#fff;border-radius:4px;cursor:pointer;font-size:12px;}',
     '#zvi-panel button:hover{border-color:#0084ff;color:#0084ff;}'
   ].join('');
+
+  /* ==================== 文本评估（可选，走 OpenAI 兼容接口） ==================== */
+
+  var AI_SYSTEM = '你是文本分析助手。你会收到同一位作者的若干条发言，需要按给定维度逐项给出 0 到 1 的小数。' +
+    '只输出一个 JSON 对象，不要任何解释文字，不要代码块标记。';
+
+  var aiCache = {};
+  var aiInflight = new Map();
+
+  function aiSave() {
+    try { GM.setValue(AI_KEY, JSON.stringify(aiCache)); } catch (e) { }
+  }
+  function aiValid(e) {
+    return e && e.result && (Date.now() - e.ts) < (cfg.llm.cacheDays || 7) * 86400000;
+  }
+
+  function aiPrompt(texts) {
+    var dims = AI_DIMS.map(function (d) { return '  "' + d.k + '": ' + d.desc; }).join('\n');
+    return '以下是同一位作者最近的 ' + texts.length + ' 条发言，用 --- 分隔：\n\n' +
+      texts.map(function (t) { return '---\n' + t; }).join('\n') + '\n\n' +
+      '请按下面 ' + AI_DIMS.length + ' 个维度逐项打分，取值 0 到 1 之间的小数（如 0.85），数值越大表示该特征越明显：\n{\n' +
+      dims + '\n}\n' +
+      '只输出这个 JSON 对象。';
+  }
+
+  /** 模型常会夹带 ```json 或前后废话，这里把 JSON 抠出来；再不行就逐维度正则抠数字 */
+  function parseAiJson(txt) {
+    if (!txt) return null;
+    var s = String(txt).trim();
+    s = s.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
+    var i = s.indexOf('{'), j = s.lastIndexOf('}');
+    if (i >= 0 && j > i) s = s.slice(i, j + 1);
+    try { return JSON.parse(s); } catch (e) { /* 落到下面的正则兜底 */ }
+    var out = {};
+    AI_DIMS.forEach(function (d) {
+      var m = new RegExp('["\']?' + d.k + '["\']?\\s*[:\\uff1a=]\\s*([0-9]*\\.?[0-9]+)').exec(txt);
+      if (m) out[d.k] = Number(m[1]);
+    });
+    return Object.keys(out).length ? out : null;
+  }
+
+  function clamp01(n) {
+    n = Number(n);
+    if (!isFinite(n)) return 0;
+    return Math.max(0, Math.min(1, n));
+  }
+
+  /** 直接的 OpenAI 兼容 /chat/completions 调用 */
+  function aiRequest(texts) {
+    var base = (cfg.llm.baseUrl || '').replace(/\/+$/, '');
+    var body = JSON.stringify({
+      model: cfg.llm.model,
+      temperature: 0,
+      max_tokens: 500,
+      messages: [
+        { role: 'system', content: AI_SYSTEM },
+        { role: 'user', content: aiPrompt(texts) }
+      ]
+    });
+    return new Promise(function (resolve, reject) {
+      GM_xmlhttpRequest({
+        method: 'POST',
+        url: base + '/chat/completions',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': 'Bearer ' + cfg.llm.apiKey
+        },
+        data: body,
+        timeout: 60000,
+        onload: function (r) {
+          if (r.status >= 200 && r.status < 300) {
+            try {
+              var j = JSON.parse(r.responseText);
+              var c = j.choices && j.choices[0] && j.choices[0].message;
+              resolve(c ? c.content : '');
+            } catch (e) { reject(new Error('返回不是 JSON')); }
+          } else {
+            var msg = '';
+            try { msg = ((JSON.parse(r.responseText) || {}).error || {}).message || ''; } catch (e) { }
+            reject(new Error(r.status + (msg ? ' ' + msg : '')));
+          }
+        },
+        onerror: function () { reject(new Error('网络错误')); },
+        ontimeout: function () { reject(new Error('超时')); }
+      });
+    });
+  }
+
+  /** 只有能转成有限数字的才算有效；模型偶尔会吐 "high" 或空串，那些按缺失处理 */
+  function aiValidNum(v) {
+    if (v === undefined || v === null) return false;
+    if (typeof v === 'string' && v.trim() === '') return false;
+    return isFinite(Number(v));
+  }
+
+  /** 合成为 0-1 总分 + 各维度明细（缺失的维度不计入分母） */
+  function aiScore(obj) {
+    var total = 0, wsum = 0, missing = [];
+    AI_DIMS.forEach(function (d) {
+      var v = obj ? obj[d.k] : undefined;
+      if (!aiValidNum(v)) { missing.push(d.k); return; }
+      total += clamp01(v) * d.w;
+      wsum += d.w;
+    });
+    return {
+      score: wsum > 0 ? Math.round((total / wsum) * 100) / 100 : 0,
+      dims: AI_DIMS.map(function (d) {
+        var has = aiValidNum(obj && obj[d.k]);
+        return { k: d.k, name: d.name, v: has ? Math.round(clamp01(obj[d.k]) * 100) / 100 : null };
+      }),
+      missing: missing,
+      model: cfg.llm.model
+    };
+  }
+
+  /** 对外入口：Promise<{score, dims, missing, model} | {error} | null> */
+  function aiAnalyze(token, texts) {
+    if (!cfg.llm.enabled || !cfg.llm.baseUrl || !cfg.llm.model) return Promise.resolve(null);
+    if (!texts || !texts.length) return Promise.resolve(null);
+    var e = aiCache[token];
+    if (aiValid(e)) return Promise.resolve(Object.assign({ fromCache: true }, e.result));
+    if (aiInflight.has(token)) return aiInflight.get(token);
+
+    var p = aiRequest(texts).then(function (txt) {
+      var obj = parseAiJson(txt);
+      if (!obj) throw new Error('返回无法解析');
+      var r = aiScore(obj);
+      aiCache[token] = { ts: Date.now(), result: r };
+      aiSave();
+      return r;
+    }).catch(function (err) {
+      return { error: (err && err.message) || '失败' };
+    }).then(function (r) {
+      aiInflight.delete(token);
+      return r;
+    });
+    aiInflight.set(token, p);
+    return p;
+  }
 
   /* ==================== 内联标注 ==================== */
 
@@ -699,6 +890,8 @@
       return '<span class="zvi-chip">' + esc(r) + '</span>';
     }).join('');
 
+    var aiSlot = cfg.llm.enabled ? '<span class="zvi-ai" data-zvi-ai hidden></span>' : '';
+
     // 每条一行：标题（单行省略） + 字数 + 相对时间，摘要放进 title 里悬停看
     var detail = s.recent.map(function (it) {
       var tip = (it.title || '') + '\n' +
@@ -722,7 +915,7 @@
     if (s.totalPosts > 0) foot.push('\u7d2f\u8ba1 ' + s.totalPosts + ' \u6761');
 
     panel.innerHTML =
-      '<div class="zvi-line">' + main + chips +
+      '<div class="zvi-line">' + main + chips + aiSlot +
       '<span class="zvi-act">' +
       '<button class="zvi-lnk" data-zvi-act="detail">\u6700\u8fd1 ' + s.recent.length + ' \u6761 \u25be</button>' +
       '</span>' +
@@ -737,6 +930,51 @@
 
     if (!mount(anchor, panel)) return;
     applyAction(token, verdict);
+    maybeAI(panel, token, data, verdict);
+  }
+
+  /** 文本评估：默认只在命中行为规则时才调用，结果回来后回填 */
+  function maybeAI(panel, token, data, verdict) {
+    if (!cfg.llm.enabled) return;
+    if (cfg.llm.onlySuspicious && !verdict.hit) return;
+    var texts = (data.stats && data.stats.texts) || [];
+    if (!texts.length) return;
+    var slot = panel.querySelector('[data-zvi-ai]');
+    if (!slot) return;
+    slot.hidden = false;
+    slot.className = 'zvi-ai is-loading';
+    slot.textContent = 'AI \u8bc4\u4f30\u4e2d';
+    aiAnalyze(token, texts).then(function (r) {
+      if (!r) { slot.hidden = true; return; }
+      renderAI(panel, slot, r);
+    });
+  }
+
+  function renderAI(panel, slot, r) {
+    if (r.error) {
+      slot.className = 'zvi-ai is-err';
+      slot.textContent = 'AI \u5931\u8d25';
+      slot.title = r.error;
+      return;
+    }
+    var s = r.score;
+    slot.className = 'zvi-ai' + (s >= cfg.llm.flagAt ? ' is-hot' : '');
+    slot.textContent = 'AI ' + s.toFixed(2);
+    var parts = r.dims.filter(function (d) { return d.v !== null; })
+      .map(function (d) { return d.name + ' ' + d.v.toFixed(2); });
+    slot.title = '\u6587\u672c\u8bc4\u4f30 ' + s.toFixed(2) + ' / 1\n' + parts.join('\n') +
+      (r.missing.length ? '\n\u7f3a\u5931\u7ef4\u5ea6\uff1a' + r.missing.join('\u3001') : '') +
+      '\n\u5f15\u64ce ' + (r.model || '?') + (r.fromCache ? '\uff08\u7f13\u5b58\uff09' : '');
+
+    var foot = panel.querySelector('.zvi-note');
+    if (foot) {
+      var line = document.createElement('span');
+      line.className = 'zvi-airow';
+      if (s >= cfg.llm.flagAt) line.classList.add('is-hot');
+      line.textContent = '\u6587\u672c\u8bc4\u4f30 ' + s.toFixed(2) + ' \u00b7 ' + parts.join(' \u00b7 ') +
+        (r.missing.length ? ' \u00b7 \u7f3a ' + r.missing.length + ' \u9879' : '');
+      foot.insertBefore(line, foot.firstChild);
+    }
   }
 
   function renderError(anchor, token, msg) {
@@ -891,6 +1129,28 @@
       opt('hide', '\u5b8c\u5168\u9690\u85cf', cfg.action) + '</select></div>' +
       '<p class="hint">\u9608\u503c\u586b 0 \u8868\u793a\u4e0d\u542f\u7528\u8be5\u6761\u3002\u767d\u540d\u5355\u91cc\u7684\u4eba\u6c38\u4e0d\u6298\u53e0\uff0c\u53ea\u6807\u8bb0\u3002</p></div>' +
 
+      '<div class="grp"><div class="row"><label><b>\u6587\u672c\u8bc4\u4f30\uff08\u53ef\u9009\uff09</b></label>' +
+      '<input type="checkbox" data-k="llm.enabled"' + (cfg.llm.enabled ? ' checked' : '') + '></div>' +
+      '<div class="row"><label>\u63a5\u53e3\u5730\u5740</label>' +
+      '<input type="text" data-k="llm.baseUrl" style="width:152px" placeholder="https://xxx/v1" value="' + esc(cfg.llm.baseUrl) + '"></div>' +
+      '<div class="row"><label>API Key</label>' +
+      '<input type="password" data-k="llm.apiKey" style="width:152px" value="' + esc(cfg.llm.apiKey) + '"></div>' +
+      '<div class="row"><label>\u6a21\u578b\u540d</label>' +
+      '<input type="text" data-k="llm.model" style="width:152px" placeholder="jev-latest" value="' + esc(cfg.llm.model) + '"></div>' +
+      '<div class="row"><label>\u53d6\u6700\u8fd1\u51e0\u6761</label>' +
+      '<input type="number" min="1" max="10" data-k="llm.maxItems" value="' + cfg.llm.maxItems + '"></div>' +
+      '<div class="row"><label>\u6bcf\u6761\u6700\u591a\uff08\u5b57\uff09</label>' +
+      '<input type="number" min="100" max="2000" step="100" data-k="llm.maxChars" value="' + cfg.llm.maxChars + '"></div>' +
+      '<div class="row"><label>\u4ec5\u547d\u4e2d\u89c4\u5219\u65f6\u5206\u6790</label>' +
+      '<input type="checkbox" data-k="llm.onlySuspicious"' + (cfg.llm.onlySuspicious ? ' checked' : '') + '></div>' +
+      '<div class="row"><label>\u6807\u7ea2\u9608\u503c \u2265</label>' +
+      '<input type="number" min="0" max="1" step="0.05" data-k="llm.flagAt" value="' + cfg.llm.flagAt + '"></div>' +
+      '<div class="row"><button data-act="aitest">\u6d4b\u8bd5\u8fde\u63a5</button></div>' +
+      '<p class="hint" data-aitip></p>' +
+      '<p class="hint">\u5740\u7a7a\u5373\u5b8c\u5168\u4e0d\u53d1\u5916\u90e8\u8bf7\u6c42\u3002\u586b\u516c\u5f00\u7684 OpenAI \u683c\u5f0f\u63a5\u53e3\u5373\u53ef\uff1a' +
+      'TypeSafe JEV\u3001OpenRouter\u3001\u5404\u5bb6\u56fd\u4ea7\u6a21\u578b\u3001\u672c\u5730 Ollama \u90fd\u884c\u3002' +
+      '\u8bc4\u4f30\u7ed3\u679c\u53ea\u4f5c\u53c2\u8003\uff0c\u4e0d\u636e\u6b64\u6298\u53e0\u6216\u9690\u85cf\u4efb\u4f55\u5185\u5bb9\u3002</p></div>' +
+
       '<div class="grp"><div class="row"><button data-act="save">\u4fdd\u5b58\u5e76\u91cd\u65b0\u626b\u63cf</button>' +
       '<button data-act="clear">\u6e05\u7a7a\u7f13\u5b58</button></div>' +
       '<p class="hint">\u767d\u540d\u5355 ' + cfg.whitelist.length + ' \u4eba \u00b7 \u5c4f\u853d\u540d\u5355 ' + cfg.blocklist.length + ' \u4eba\u3002' +
@@ -910,6 +1170,7 @@
       var k = el.getAttribute('data-k');
       var v = el.type === 'checkbox' ? el.checked : (el.type === 'number' ? Number(el.value) : el.value);
       if (k.indexOf('burst.') === 0) cfg.burst[k.slice(6)] = v;
+      else if (k.indexOf('llm.') === 0) cfg.llm[k.slice(4)] = v;
       else cfg[k] = v;
     });
     persistCfg();
@@ -932,13 +1193,35 @@
       var act = e.target.getAttribute && e.target.getAttribute('data-act');
       if (!act) return;
       if (act === 'save') { readPanel(); rescan(); panel.remove(); panel = null; }
+      if (act === 'aitest') { readPanel(); aiTest(); return; }
       if (act === 'clear') {
-        cache = {}; lenCache = {};
-        try { GM.setValue(CACHE_KEY, '{}'); GM.setValue(LEN_KEY, '{}'); } catch (err) { }
+        cache = {}; lenCache = {}; aiCache = {};
+        try { GM.setValue(CACHE_KEY, '{}'); GM.setValue(LEN_KEY, '{}'); GM.setValue(AI_KEY, '{}'); } catch (err) { }
         rescan();
       }
     });
     panel.addEventListener('change', function () { readPanel(); });
+  }
+
+  /** 用一段假文本打一次接口，验证地址、key、模型和返回格式能不能对上 */
+  function aiTest() {
+    if (!panel) return;
+    var tip = panel.querySelector('[data-aitip]');
+    if (!tip) return;
+    if (!cfg.llm.baseUrl || !cfg.llm.model) { tip.textContent = '\u5148\u586b\u63a5\u53e3\u5730\u5740\u548c\u6a21\u578b\u540d'; return; }
+    tip.textContent = '\u6d4b\u8bd5\u4e2d\u2026';
+    aiRequest(['\u8fd9\u662f\u4e00\u6761\u6d4b\u8bd5\u6587\u672c\u3002\u6211\u4e0a\u4e2a\u6708\u5728\u676d\u5dde\u51fa\u5dee\u65f6\u9047\u5230\u8fc7\u7c7b\u4f3c\u60c5\u51b5\uff0c' +
+      '\u5f53\u65f6\u82b1\u4e86\u4e24\u5929\u624d\u628a\u95ee\u9898\u89e3\u51b3\uff0c\u5177\u4f53\u662f\u5728\u5ba2\u6237\u73b0\u573a\u8dd1\u4e86\u4e09\u8d9f\u3002'])
+      .then(function (txt) {
+        var obj = parseAiJson(txt);
+        if (!obj) { tip.textContent = '\u8fde\u4e0a\u4e86\uff0c\u4f46\u8fd4\u56de\u65e0\u6cd5\u89e3\u6790\uff1a' + String(txt).slice(0, 90); return; }
+        var r = aiScore(obj);
+        var got = r.dims.filter(function (d) { return d.v !== null; }).length;
+        tip.textContent = '\u53ef\u7528\u3002\u6d4b\u8bd5\u5f97\u5206 ' + r.score.toFixed(2) +
+          '\uff0c\u8bc6\u522b\u5230 ' + got + '/' + AI_DIMS.length + ' \u4e2a\u7ef4\u5ea6' +
+          (r.missing.length ? '\uff08\u7f3a\uff1a' + r.missing.join('\u3001') + '\uff09' : '');
+      })
+      .catch(function (e) { tip.textContent = '\u5931\u8d25\uff1a' + ((e && e.message) || e); });
   }
 
   /* ==================== 事件 ==================== */
@@ -1061,6 +1344,7 @@
             var saved = JSON.parse(v);
             Object.assign(cfg, saved);
             cfg.burst = Object.assign({}, DEFAULT_CFG.burst, saved.burst || {});
+            cfg.llm = Object.assign({}, DEFAULT_CFG.llm, saved.llm || {});
             cfg.whitelist = Array.isArray(saved.whitelist) ? saved.whitelist : [];
             cfg.blocklist = Array.isArray(saved.blocklist) ? saved.blocklist : [];
           } catch (e) { }
@@ -1069,6 +1353,7 @@
       }).catch(function () { scheduleScan(600); });
       GM.getValue(CACHE_KEY, '{}').then(function (v) { try { cache = JSON.parse(v) || {}; } catch (e) { cache = {}; } }).catch(function () { });
       GM.getValue(LEN_KEY, '{}').then(function (v) { try { lenCache = JSON.parse(v) || {}; } catch (e) { lenCache = {}; } }).catch(function () { });
+      GM.getValue(AI_KEY, '{}').then(function (v) { try { aiCache = JSON.parse(v) || {}; } catch (e) { aiCache = {}; } }).catch(function () { });
     } catch (e) { scheduleScan(600); }
 
     document.addEventListener('mouseover', onMouseOver, true);
@@ -1093,8 +1378,8 @@
     });
     GM_registerMenuCommand('[\u53d1\u8a00\u753b\u50cf] \u91cd\u65b0\u626b\u63cf\u672c\u9875', function () { rescan(); });
     GM_registerMenuCommand('[\u53d1\u8a00\u753b\u50cf] \u6e05\u7a7a\u7f13\u5b58', function () {
-      cache = {}; lenCache = {};
-      try { GM.setValue(CACHE_KEY, '{}'); GM.setValue(LEN_KEY, '{}'); } catch (e) { }
+      cache = {}; lenCache = {}; aiCache = {};
+      try { GM.setValue(CACHE_KEY, '{}'); GM.setValue(LEN_KEY, '{}'); GM.setValue(AI_KEY, '{}'); } catch (e) { }
       rescan();
     });
     GM_registerMenuCommand('[\u53d1\u8a00\u753b\u50cf] \u81ea\u68c0\uff08\u8f93\u51fa\u5230\u63a7\u5236\u53f0\uff09', function () {
