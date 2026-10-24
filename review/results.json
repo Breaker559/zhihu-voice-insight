@@ -1,0 +1,135 @@
+{
+  "sourceCommit": "29def6115c2b967d47ee5584bf2b127f7292beda",
+  "browser": "147.0.7727.15",
+  "network": "All requests mocked locally",
+  "findings": [
+    {
+      "finding": "Default action contradicts documented mark-only default",
+      "reproduced": true,
+      "evidence": {
+        "action": "collapse",
+        "collapsed": 1
+      }
+    },
+    {
+      "finding": "Do-not-block button cannot resolve the author token",
+      "reproduced": true,
+      "evidence": {
+        "whitelist": [],
+        "collapsed": 1,
+        "host": false
+      }
+    },
+    {
+      "finding": "MutationObserver perpetually retriggers scanning on an idle page",
+      "reproduced": true,
+      "evidence": {
+        "badgeWrites": 3,
+        "requests": 0
+      }
+    },
+    {
+      "finding": "List API failures skip fallback and are cached as empty success",
+      "reproduced": true,
+      "evidence": {
+        "name": "Alice",
+        "fetched": 0,
+        "error": null,
+        "fallbackRequests": 0,
+        "cachedAsSuccess": true
+      }
+    },
+    {
+      "finding": "HTML fallback attributes other users and answers to the target",
+      "reproduced": true,
+      "evidence": {
+        "requestedToken": "alice",
+        "profileToken": "other",
+        "profileName": "Other user",
+        "answerIds": [
+          "999",
+          "1"
+        ]
+      }
+    },
+    {
+      "finding": "Configuration changes reuse incompatible computed-data cache",
+      "reproduced": true,
+      "evidence": {
+        "configuredShowLimit": 10,
+        "actualRecent": 5,
+        "textsForAI": 0,
+        "actualAvgLen": 10,
+        "expectedWordLength": 2,
+        "requestsBefore": 3,
+        "requestsAfter": 3,
+        "fromCache": true
+      }
+    },
+    {
+      "finding": "Seven/thirty-day totals silently stop at the first API page",
+      "reproduced": true,
+      "evidence": {
+        "knownPostsInFixture": 60,
+        "displayed7Days": 20,
+        "displayed30Days": 20,
+        "sample": 20,
+        "answerRequests": 1
+      }
+    },
+    {
+      "finding": "Excerpt lengths trigger short-post blocking as if they were full text",
+      "reproduced": true,
+      "evidence": {
+        "avgLen": 30,
+        "allApproximate": true,
+        "reasons": [
+          "短句灌水：均 30 字"
+        ]
+      }
+    },
+    {
+      "finding": "Empty model output is accepted and cached as a zero score",
+      "reproduced": true,
+      "evidence": {
+        "emptyScore": 0,
+        "missing": 7,
+        "error": null,
+        "configuredModel": "model-b",
+        "actualModel": "model-a",
+        "fromCache": true,
+        "posts": 1
+      }
+    },
+    {
+      "finding": "Model changes reuse the previous model and text result",
+      "reproduced": true,
+      "evidence": {
+        "emptyScore": 0,
+        "missing": 7,
+        "error": null,
+        "configuredModel": "model-b",
+        "actualModel": "model-a",
+        "fromCache": true,
+        "posts": 1
+      }
+    },
+    {
+      "finding": "Hover-card links cannot receive mouse input",
+      "reproduced": true,
+      "evidence": {
+        "pointerEvents": "none",
+        "linkReceivesPointer": false
+      }
+    },
+    {
+      "finding": "In-flight scans still mount panels after switching off",
+      "reproduced": true,
+      "evidence": {
+        "mode": "off",
+        "panels": 1,
+        "collapsed": 0
+      }
+    }
+  ]
+}

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         知乎发言画像 · 发言频率/字数标注与刷屏屏蔽
 // @namespace    zhihu-voice-insight
-// @version      2.7.0
+// @version      2.8.0
 // @description  在知乎答主头像/昵称下方直接插入一条发言画像：近 7/30 天条数、平均间隔、正文字数、最近发言列表；自动识别「几分钟内连发多条、一小时内刷屏、新号高产、短句灌水」，可按规则折叠或隐藏其回答；可选接 OpenAI 兼容接口做文本评估。
 // @author       WorkBuddy
 // @match        https://*.zhihu.com/*
@@ -32,7 +32,7 @@
     cacheMinutes: 30,
     exactLength: false,      // true = 为最近几条单独请求正文取精确字数（更慢）
     countMode: 'char',       // char = 字符数（中文口径）；word = 中日韩字符 + 英文单词
-    maxPerPage: 15,          // 单页最多标注多少个作者
+    maxPerPage: 15,          // 每批最多处理多少张卡片
 
     burst: {
       enabled: true,
@@ -46,7 +46,7 @@
       shortLen: 50,          // 平均字数 < N
       shortDays: 10          // 且近 30 天 ≥ N 条
     },
-    action: 'collapse',      // mark = 仅标记；collapse = 折叠；hide = 隐藏
+    action: 'mark',          // mark = 仅标记；collapse = 折叠；hide = 隐藏
     whitelist: [],           // 永不屏蔽
     blocklist: [],           // 手动屏蔽
 
@@ -67,7 +67,7 @@
   var cfg = JSON.parse(JSON.stringify(DEFAULT_CFG));
 
   var CFG_KEY = 'zvi_cfg_v2';
-  var CACHE_KEY = 'zvi_cache_v2';
+  var CACHE_KEY = 'zvi_cache_v3'; // v3 保留高频窗口的全部证据，不能复用旧统计
   var LEN_KEY = 'zvi_len_v2';
   var AI_KEY = 'zvi_ai_v1';
 
@@ -85,7 +85,6 @@
   var cache = {};      // token -> { ts, data }
   var lenCache = {};   // answerId/articleId -> 字数
   var inflight = new Map();
-  var pending = new Set();
   var API = 'https://www.zhihu.com/api/v4';
 
   // 关键：必须显式 include content，否则知乎只返回约 100 字的 excerpt
@@ -128,9 +127,9 @@
 
   var CJK_RE = /[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\u3040-\u30ff\uac00-\ud7af]/g;
 
-  function countText(text) {
+  function countText(text, mode) {
     if (!text) return 0;
-    if (cfg.countMode === 'word') {
+    if ((mode || cfg.countMode) === 'word') {
       var cjk = (text.match(CJK_RE) || []).length;
       var rest = text.replace(CJK_RE, ' ');
       var words = (rest.match(/[A-Za-z0-9][A-Za-z0-9'_.\-]*/g) || []).length;
@@ -308,6 +307,7 @@
   function normalizeProfile(raw) {
     if (!raw || typeof raw !== 'object') return {};
     return {
+      id: raw.id || '',
       name: raw.name || '',
       headline: raw.headline || '',
       follower: num(raw.follower_count, raw.followerCount),
@@ -363,6 +363,25 @@
     return best;
   }
 
+  // 除了条数，还保留造成该峰值的记录；并列时选择时间更近的一段。
+  function busiestWindow(items, winSec) {
+    var bestStart = 0, bestEnd = -1, start = 0;
+    for (var end = 0; end < items.length; end++) {
+      while (items[end].ts - items[start].ts > winSec) start++;
+      if (end - start >= bestEnd - bestStart) { bestStart = start; bestEnd = end; }
+    }
+    var posts = items.slice(bestStart, bestEnd + 1);
+    return { count: posts.length, start: posts.length ? posts[0].ts : 0,
+      end: posts.length ? posts[posts.length - 1].ts : 0, items: posts };
+  }
+
+  var BURST_WINDOWS = [
+    { key: 'm1', cfgKey: 'min1', seconds: 60, label: '1 分钟' },
+    { key: 'm5', cfgKey: 'min5', seconds: 300, label: '5 分钟' },
+    { key: 'h1', cfgKey: 'hour', seconds: 3600, label: '1 小时' },
+    { key: 'd1', cfgKey: 'day', seconds: 86400, label: '24 小时' }
+  ];
+
   function buildStats(profile, answers, articles, opts) {
     opts = opts || {};
     var items = [];
@@ -370,11 +389,16 @@
     if (opts.includeArticles !== false) {
       (articles || []).forEach(function (a) { var n = normalizeArticle(a); if (n) items.push(n); });
     }
-    items.sort(function (x, y) { return y.ts - x.ts; });
-
     var DAY = 86400;
     var now = Math.floor(Date.now() / 1000);
-    var asc = items.map(function (i) { return i.ts; }).slice().sort(function (a, b) { return a - b; });
+    var seen = new Set();
+    items = items.filter(function (it) {
+      var key = it.kind + ':' + it.id;
+      if (it.ts > now || (it.id && seen.has(key))) return false;
+      if (it.id) seen.add(key);
+      return true;
+    });
+    items.sort(function (x, y) { return y.ts - x.ts; });
 
     var lens = items.map(function (i) { return i.len; }).filter(function (n) { return n > 0; });
     var avgLen = lens.length ? Math.round(lens.reduce(function (a, b) { return a + b; }, 0) / lens.length) : 0;
@@ -386,13 +410,6 @@
       items.forEach(function (i) { if (i.ts >= edge) n++; });
       return n;
     }
-
-    var burst = {
-      m1: maxInWindow(asc, 60),
-      m5: maxInWindow(asc, 300),
-      h1: maxInWindow(asc, 3600),
-      d1: maxInWindow(asc, 86400)
-    };
 
     var lastTs = items.length ? items[0].ts : 0;
     var avgGapHours = null;
@@ -414,16 +431,25 @@
 
     // 最近发言：额外带一段截断的正文摘录，完整正文不进缓存
     var snipCap = (opts.snipChars === 0 || opts.snipChars === '0') ? 0 : (opts.snipChars || 120);
-    var recent = items.slice(0, opts.showLimit || 5).map(function (it) {
+    var samples = items.map(function (it) {
       var c = Object.assign({}, it);
       var raw = (it.raw || '').replace(/\s+/g, ' ').trim();
       c.snip = snipCap > 0 ? raw.slice(0, snipCap) : '';
       delete c.raw;
       return c;
     });
+    var recent = samples.slice(0, opts.showLimit || 5);
+    var ascending = samples.slice().reverse(), burst = {}, windows = {};
+    BURST_WINDOWS.forEach(function (rule) {
+      windows[rule.key] = busiestWindow(ascending, rule.seconds);
+      burst[rule.key] = windows[rule.key].count;
+    });
 
     return {
       recent: recent,
+      samples: samples,
+      windows: windows,
+      lengthReliable: items.length > 0 && items.every(function (it) { return !it.approx; }),
       texts: texts,
       totalFetched: items.length,
       d7: inWindow(7), d30: inWindow(30),
@@ -446,6 +472,13 @@
     var b = cfg.burst;
     var s = data.stats;
     var reasons = [];
+    var windows = [];
+    BURST_WINDOWS.forEach(function (rule) {
+      var w = s.windows && s.windows[rule.key];
+      if (cfg.burst[rule.cfgKey] > 0 && w && w.count >= cfg.burst[rule.cfgKey]) {
+        windows.push(Object.assign({ key: rule.key, label: rule.label }, w));
+      }
+    });
     if (b.min1 && s.burst.m1 >= b.min1) reasons.push('1 \u5206\u949f\u5185\u8fde\u53d1 ' + s.burst.m1 + ' \u6761');
     if (b.min5 && s.burst.m5 >= b.min5) reasons.push('5 \u5206\u949f\u5185\u8fde\u53d1 ' + s.burst.m5 + ' \u6761');
     if (b.hour && s.burst.h1 >= b.hour) reasons.push('1 \u5c0f\u65f6\u5185 ' + s.burst.h1 + ' \u6761');
@@ -456,24 +489,29 @@
     if (b.newDays && s.accountDays !== null && s.accountDays <= b.newDays && s.totalPosts >= b.newPosts) {
       reasons.push('\u65b0\u53f7\u9ad8\u4ea7\uff1a\u6ce8\u518c ' + s.accountDays + ' \u5929 / ' + s.totalPosts + ' \u6761');
     }
-    if (b.shortLen && s.avgLen > 0 && s.avgLen < b.shortLen && s.d30 >= b.shortDays) {
+    if (b.shortLen && s.lengthReliable && s.avgLen > 0 && s.avgLen < b.shortLen && s.d30 >= b.shortDays) {
       reasons.push('\u77ed\u53e5\u704c\u6c34\uff1a\u5747 ' + s.avgLen + ' \u5b57');
     }
-    return { hit: reasons.length > 0, reasons: reasons };
+    return { hit: reasons.length > 0, reasons: reasons, windows: windows,
+      frequent: windows.length > 0 || !!(b.gapHours && s.avgGapHours !== null &&
+        s.avgGapHours < b.gapHours && s.totalFetched >= 5) };
   }
 
   /** 精确字数：为单条内容单独请求正文 */
   function exactLength(item) {
-    if (!item.id || lenCache[item.id] !== undefined) return Promise.resolve();
+    var key = lengthKey(item), mode = cfg.countMode;
+    if (!item.id || lenCache[key] !== undefined) return Promise.resolve();
     var url = item.kind === 'ans'
       ? API + '/answers/' + encodeURIComponent(item.id) + '?include=content'
       : API + '/articles/' + encodeURIComponent(item.id) + '?include=content';
     return jsonOf(url).then(function (r) {
       if (!r || !r.content) return;
-      lenCache[item.id] = countText(stripHtml(r.content));
+      lenCache[key] = countText(stripHtml(r.content), mode);
       saveLen();
     });
   }
+
+  function lengthKey(item) { return item.kind + ':' + item.id + ':' + cfg.countMode; }
 
   function loadMember(token) {
     var t = encodeURIComponent(token);
@@ -492,26 +530,35 @@
       var profile = (res[0] && !res[0].error) ? normalizeProfile(res[0]) : {};
       var answers = (res[1] && Array.isArray(res[1].data)) ? res[1].data : [];
       var articles = (res[2] && Array.isArray(res[2].data)) ? res[2].data : [];
+      var answersOK = !!(res[1] && Array.isArray(res[1].data) && !res[1].error);
+      var articlesOK = !cfg.includeArticles || !!(res[2] && Array.isArray(res[2].data) && !res[2].error);
       var source = 'api';
 
       var chain = Promise.resolve();
-      if (!answers.length && !articles.length && !profile.name) {
+      if (!answersOK || !articlesOK) {
         // 接口被拦（未登录 / 需要签名）→ 退回个人主页 HTML
         chain = getText('https://www.zhihu.com/people/' + t + '/answers').then(function (h) {
-          if (!h || !h.text) return;
+          if (!h || !h.ok || !h.text) return;
           var ex = extractFromJson(parseInitialData(h.text) || {});
           if (!ex) return;
-          answers = ex.answers.slice(0, limit);
-          articles = ex.articles.slice(0, limit);
-          var hit = null;
-          ex.people.forEach(function (p) {
-            if (!hit && ((p.url_token || p.urlToken) === token || (p.id && p.name))) hit = p;
-          });
-          profile = normalizeProfile(hit || ex.people[0] || {});
+          var hit = ex.people.find(function (p) { return (p.url_token || p.urlToken) === token; });
+          if (hit) profile = normalizeProfile(hit);
+          function ownPosts(posts) {
+            return posts.filter(function (post) {
+              var author = post.author || {};
+              return (author.url_token || author.urlToken) === token ||
+                !!(profile.id && String(author.id || author) === String(profile.id));
+            }).sort(function (a, b) { return num(b.created_time, b.created) - num(a.created_time, a.created); }).slice(0, limit);
+          }
+          if (!answersOK) answers = ownPosts(ex.answers);
+          if (!articlesOK) articles = ownPosts(ex.articles);
           source = 'html';
         });
       }
       return chain.then(function () {
+        if (!answers.length && !articles.length && (!answersOK || !articlesOK)) {
+          return { token: token, error: '发言列表读取失败，请稍后重新扫描或打开作者主页' };
+        }
         var data = {
           token: token,
           profile: profile,
@@ -524,15 +571,22 @@
             snipChars: cfg.snipChars
           }),
           source: source,
+          partial: !answersOK || !articlesOK,
           fetchedAt: Date.now()
         };
         if (cfg.exactLength) {
           return Promise.all(data.stats.recent.map(exactLength)).then(function () {
             data.stats.recent.forEach(function (it) {
-              if (lenCache[it.id] !== undefined) { it.len = lenCache[it.id]; it.approx = false; }
+              var key = lengthKey(it);
+              if (lenCache[key] !== undefined) { it.len = lenCache[key]; it.approx = false; }
             });
-            var lens = data.stats.recent.map(function (i) { return i.len; });
-            if (lens.length) data.stats.avgLen = Math.round(lens.reduce(function (a, b) { return a + b; }, 0) / lens.length);
+            var lens = data.stats.samples.map(function (i) { return i.len; }).filter(function (n) { return n > 0; });
+            if (lens.length) {
+              data.stats.avgLen = Math.round(lens.reduce(function (a, b) { return a + b; }, 0) / lens.length);
+              data.stats.medLen = median(lens);
+              data.stats.maxLen = Math.max.apply(null, lens);
+            }
+            data.stats.lengthReliable = data.stats.samples.length > 0 && data.stats.samples.every(function (it) { return !it.approx; });
             return data;
           });
         }
@@ -545,7 +599,12 @@
 
   /* ==================== 缓存 ==================== */
 
-  function cacheValid(e) { return e && e.data && (Date.now() - e.ts) < cfg.cacheMinutes * 60000; }
+  function dataSignature() {
+    return JSON.stringify([cfg.fetchLimit, cfg.showLimit, cfg.snipChars, cfg.includeArticles,
+      cfg.countMode, cfg.exactLength, cfg.llm.enabled, cfg.llm.maxItems, cfg.llm.maxChars]);
+  }
+
+  function cacheValid(e) { return e && e.data && e.signature === dataSignature() && (Date.now() - e.ts) < cfg.cacheMinutes * 60000; }
 
   var saveTimer = null, lenTimer = null;
   function saveCache() {
@@ -565,15 +624,17 @@
   }
 
   function getData(token, force) {
+    var signature = dataSignature(), key = JSON.stringify([token, signature]);
     var e = cache[token];
     if (!force && cacheValid(e)) return Promise.resolve(Object.assign({ fromCache: true }, e.data));
-    if (inflight.has(token)) return inflight.get(token);
+    if (inflight.has(key)) return inflight.get(key);
     var p = loadMember(token).then(function (d) {
-      inflight.delete(token);
-      if (!d.error) { cache[token] = { ts: Date.now(), data: d }; saveCache(); }
+      if (!d.error && !d.partial && signature === dataSignature()) {
+        cache[token] = { ts: Date.now(), signature: signature, data: d }; saveCache();
+      }
       return d;
-    });
-    inflight.set(token, p);
+    }).finally(function () { inflight.delete(key); });
+    inflight.set(key, p);
     return p;
   }
 
@@ -623,12 +684,29 @@
     '.zvi-note{display:flex;flex-wrap:wrap;align-items:center;gap:4px 6px;color:#b6bbc1;font-size:11px;',
     'margin-top:5px;padding-top:5px;border-top:1px solid #f3f5f7;}',
 
-    '.zvi-collapsed > *:not(.zvi-bar){display:none !important;}',
-    '.zvi-bar{display:flex;align-items:center;gap:10px;padding:9px 12px;margin:0 0 8px;',
+    '[data-zvi-card].zvi-collapsed > *:not(.zvi-bar){display:none !important;}',
+    '.zvi-bar{display:block;padding:9px 12px;margin:0 0 8px;',
     'border:1px dashed #f0d5bd;background:#fffdfa;border-radius:8px;color:#9c6a3c;font-size:12px;}',
+    '.zvi-barline{display:flex;flex-wrap:wrap;align-items:center;gap:8px;}',
     '.zvi-bar b{color:#d4380d;}',
     '.zvi-marked{border-left:3px solid #ff922b;padding-left:8px;}',
-    '.zvi-hidden{display:none !important;}',
+    '[data-zvi-card].zvi-hidden{display:none !important;}',
+    '.zvi-evidence{margin-top:6px;color:#555;font-size:12px;line-height:1.6;}',
+    '.zvi-evidence>summary{color:#a65121;cursor:pointer;font-weight:600;}',
+    '.zvi-window{margin:8px 0;padding:8px 10px;background:#fff;border:1px solid #eef0f2;border-radius:6px;}',
+    '.zvi-proof-note{color:#777;font-size:11px;line-height:1.6;margin:4px 0;overflow-wrap:anywhere;}',
+    '.zvi-proof-list{list-style:none!important;margin:8px 0 0!important;padding:0 0 0 10px!important;',
+    'border-left:2px solid #f0d5bd;max-height:300px;overflow:auto;}',
+    '.zvi-proof-list>li{padding:6px 0!important;border:0!important;overflow-wrap:anywhere;}',
+    '.zvi-proof-list a{color:#14448c;text-decoration:none;}',
+    '.zvi-proof-time{font:11px/1.6 Consolas,monospace;color:#777;}',
+    '.zvi-author-entry{padding:9px 0;border-top:1px solid #eef0f2;}',
+    '.zvi-author-entry>summary{cursor:pointer;color:#444;}',
+    '.zvi-author-entry>summary span{font-size:11px;color:#777;margin-left:8px;}',
+    '.zvi-author-actions{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px;}',
+    '#zvi-panel [data-zvi-authors]{max-height:45vh;overflow:auto;}',
+    '#zvi-panel button:focus-visible,.zvi-btn:focus-visible,.zvi-evidence summary:focus-visible,',
+    '.zvi-author-entry summary:focus-visible,#zvi-fab:focus-visible{outline:2px solid #0084ff;outline-offset:2px;}',
 
     '#zvi-fab{position:fixed;right:18px;bottom:18px;z-index:2147483000;display:flex;align-items:center;gap:6px;',
     'padding:7px 12px;border-radius:20px;background:#fff;border:1px solid #e0e0e0;',
@@ -636,7 +714,7 @@
     'font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;user-select:none;}',
     '#zvi-fab:hover{border-color:#0084ff;color:#0084ff;}',
     '#zvi-fab .zvi-n{background:#f5222d;color:#fff;border-radius:9px;padding:0 6px;font-size:11px;}',
-    '#zvi-panel{position:fixed;right:18px;bottom:62px;z-index:2147483001;width:330px;max-height:70vh;overflow:auto;',
+    '#zvi-panel{position:fixed;right:12px;bottom:62px;z-index:2147483001;width:390px;max-width:calc(100vw - 24px);box-sizing:border-box;max-height:78vh;overflow:auto;',
     'background:#fff;border:1px solid #e0e0e0;border-radius:12px;box-shadow:0 10px 34px rgba(0,0,0,.2);',
     'padding:14px;font-size:12px;color:#333;',
     'font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;}',
@@ -797,92 +875,184 @@
   // 注意：不要用 .Card 之类的泛化类名——知乎的作者小卡片也用 Card，
   // closest() 会就近命中窄的作者列，导致面板被塞进 360px 的框里
   var CONTENT_SEL = '.RichText, .RichContent, .Post-RichText, .AnswerItem-content, [class*="RichText"]';
-  var SKIP_SEL = '.Comments-container, .CommentItem, .Comments, .zvi-inline, #zvi-panel, #zvi-fab';
+  var SKIP_SEL = '.Comments-container, .CommentItem, .Comments, .zvi-inline, .zvi-bar, #zvi-panel, #zvi-fab, header, nav, aside';
+  var PAGE_SEL = 'html, body, main, [role="main"], #root, #app, #js-client-mount, .App, .App-main, .QuestionPage, .Question-main, .Question-mainColumn, .Topstory-container, .Topstory-mainColumn, .Profile-main';
+  var cardStates = new Map(); // 只处理从作者链接验证过的具体卡片，不再从标记向上猜祖先
+  var shownTokens = new Set();
+  var scanGeneration = 0;
 
-  /** 从作者链接往上找：第一个「内部含正文块」的祖先才是这条内容所属的卡片 */
+  function cardContent(root) {
+    if (!root || !root.isConnected || !root.matches(ITEM_SEL) || root.matches(PAGE_SEL) ||
+      root.querySelector('main, [role="main"], #root, #app, #js-client-mount')) return null;
+    var blocks = [].slice.call(root.querySelectorAll(CONTENT_SEL)).filter(function (c) {
+      if (c.closest(SKIP_SEL)) return false;
+      var parent = c.parentElement && c.parentElement.closest(CONTENT_SEL);
+      return !parent || !root.contains(parent);
+    });
+    if (blocks.length !== 1) return null;
+    var content = blocks[0];
+    // 外层 article/List-item 可能是整条信息流。存在另一张独立卡片时拒绝处理。
+    var nested = [].slice.call(root.querySelectorAll(ITEM_SEL));
+    if (nested.some(function (c) { return !c.contains(content) && !content.contains(c) && !c.closest(SKIP_SEL); })) return null;
+    return content;
+  }
+
+  /** 只认最近的明确内容卡片；识别失败时不标注、不折叠，绝不向页面祖先兜底。 */
   function locate(a) {
-    var el = a.parentElement, depth = 0;
-    while (el && depth++ < 12) {
-      var c = el.querySelector(CONTENT_SEL);
-      if (c) return { item: el, content: c };
-      el = el.parentElement;
+    var root = a && a.closest ? a.closest(ITEM_SEL) : null;
+    var content = cardContent(root);
+    if (a && !notAuthorLink(a) && content && (content.compareDocumentPosition(a) & 2)) {
+      return { item: root, content: content };
     }
-    var near = a.closest ? a.closest(ITEM_SEL) : null;
-    if (near) return { item: near, content: near.querySelector(CONTENT_SEL) };
     return { item: null, content: null };
   }
 
-  /**
-   * 挂载：插在正文块之前（作者行下方），确保不压住昵称头像、也不受作者列宽度限制。
-   * 找不到正文块时退到卡片内、操作栏之前；再退到作者行之后（强制整宽）。
-   */
+  /** 只在已确认卡片的正文之前挂载；不再向作者行或页面容器兜底。 */
   function mount(a, panel) {
     var loc = locate(a);
-    if (loc.content && loc.content.parentElement) {
+    if (loc.item && loc.content && loc.content.parentElement) {
       loc.content.insertAdjacentElement('beforebegin', panel);
       return true;
-    }
-    if (loc.item) {
-      var acts = loc.item.querySelector('.ContentItem-actions, .AnswerItem-actions, .RichContent-actions');
-      loc.item.insertBefore(panel, acts || null);
-      return true;
-    }
-    var el = a, i = 0;
-    while (el && i++ < 8) {
-      var cm = el.className ? String(el.className) : '';
-      if (/AuthorInfo|authorInfo/i.test(cm) && el.parentElement) {
-        panel.style.flexBasis = '100%';
-        el.insertAdjacentElement('afterend', panel);
-        return true;
-      }
-      el = el.parentElement;
     }
     return false;
   }
 
-  function itemContainer(el) {
-    var sels = ['.ContentItem', '.AnswerItem', '.List-item', '.Post', 'article'];
-    for (var i = 0; i < sels.length; i++) {
-      var c = el.closest ? el.closest(sels[i]) : null;
-      if (c) return c;
-    }
-    var p = el.parentElement;
-    for (var j = 0; j < 3 && p; j++) p = p.parentElement;
-    return p || el;
+  function restoreCard(root) {
+    root.classList.remove('zvi-collapsed', 'zvi-hidden', 'zvi-marked');
+    [].slice.call(root.children).forEach(function (child) {
+      if (child.classList.contains('zvi-bar')) child.remove();
+    });
   }
 
-  var blockedCount = 0;
+  function validCard(root, state) {
+    return root.isConnected && locate(state.anchor).item === root &&
+      tokenFromHref(state.anchor.getAttribute('href')) === state.token;
+  }
 
   function applyAction(token, verdict) {
-    var action = cfg.action;
-    if (cfg.whitelist.indexOf(token) >= 0) action = 'mark';
     var manual = cfg.blocklist.indexOf(token) >= 0;
-    var shouldAct = cfg.burst.enabled && (verdict.hit || manual);
-    if (!shouldAct || action === 'mark') {
-      document.querySelectorAll('[data-zvi="' + cssEsc(token) + '"]').forEach(function (b) {
-        var c = itemContainer(b);
-        if (c && verdict.hit) c.classList.add('zvi-marked');
-      });
-      return;
-    }
-    document.querySelectorAll('[data-zvi="' + cssEsc(token) + '"]').forEach(function (b) {
-      var c = itemContainer(b);
-      if (!c) return;
-      if (action === 'hide') { c.classList.add('zvi-hidden'); blockedCount++; return; }
-      if (c.classList.contains('zvi-collapsed')) return;
+    var action = manual && cfg.action === 'mark' ? 'collapse' : cfg.action;
+    if (cfg.whitelist.indexOf(token) >= 0 || shownTokens.has(token)) action = 'mark';
+    var shouldAct = cfg.mode === 'inline' && (manual || (cfg.burst.enabled && verdict.hit));
+    cardStates.forEach(function (state, c) {
+      if (state.token !== token) return;
+      restoreCard(c);
+      if (!validCard(c, state)) return;
+      if (!shouldAct || action === 'mark') {
+        if (verdict.hit && cfg.mode === 'inline') c.classList.add('zvi-marked');
+        return;
+      }
+      if (action === 'hide') { c.classList.add('zvi-hidden'); return; }
+      if (action !== 'collapse') return;
       var bar = document.createElement('div');
       bar.className = 'zvi-bar';
-      bar.innerHTML = '<span>\u5df2\u6298\u53e0\uff1a<b>' + esc(verdict.reasons.join('\uff1b') || '\u624b\u52a8\u5c4f\u853d') +
-        '</b></span><button class="zvi-btn" data-zvi-act="unfold">\u5c55\u5f00</button>' +
-        '<button class="zvi-btn" data-zvi-act="wl">\u4e0d\u518d\u5c4f\u853d</button>';
+      bar.setAttribute('data-zvi-owner', token);
+      bar.innerHTML = '<div class="zvi-barline"><span>已折叠 · <b>' + esc(state.data.profile.name || token) +
+        '</b>：' + esc(verdict.reasons.join('；') || '手动屏蔽') +
+        '</span><button type="button" class="zvi-btn" data-zvi-act="unfold">显示此人回答</button>' +
+        '<button type="button" class="zvi-btn" data-zvi-act="wl">不再屏蔽</button></div>' +
+        renderBurstEvidence(state.data, verdict, token);
       c.insertBefore(bar, c.firstChild);
       c.classList.add('zvi-collapsed');
-      blockedCount++;
     });
     updateFab();
   }
 
   function cssEsc(s) { return String(s).replace(/["\\]/g, '\\$&'); }
+
+  function durationText(seconds) {
+    seconds = Math.max(0, Math.round(seconds));
+    if (!seconds) return '同一秒';
+    if (seconds < 60) return seconds + ' 秒';
+    if (seconds < 3600) return Math.floor(seconds / 60) + ' 分 ' + seconds % 60 + ' 秒';
+    return Math.floor(seconds / 3600) + ' 小时 ' + Math.floor(seconds % 3600 / 60) + ' 分';
+  }
+
+  function timeWithSeconds(ts) { return fmtTime(ts) + ':' + pad(new Date(ts * 1000).getSeconds()); }
+
+  function renderBurstEvidence(data, verdict, token) {
+    var windows = verdict.windows || [];
+    if (!windows.length && !verdict.frequent) return '';
+    if (!windows.length) {
+      var samples = (data.stats.samples || []).slice().reverse();
+      windows = [{ key: 'gap', label: '样本平均间隔 ' + data.stats.avgGapText,
+        count: samples.length, items: samples, start: samples[0] && samples[0].ts,
+        end: samples.length && samples[samples.length - 1].ts }];
+    }
+    // 多条规则命中完全相同的一组记录时，合并展示，避免重复铺满面板。
+    var groups = [];
+    windows.forEach(function (w) {
+      var key = w.items.map(function (it) { return it.kind + ':' + it.id + ':' + it.ts; }).join('|');
+      var group = groups.find(function (g) { return g.key === key; });
+      if (group) { group.labels.push(w.label); return; }
+      groups.push({ key: key, window: w, labels: [w.label] });
+    });
+    return '<details class="zvi-evidence" data-evidence-key="' + esc(token + ':proof') + '">' +
+      '<summary>查看高频发言 · ' + groups.length + ' 组记录</summary>' +
+      '<p class="zvi-proof-note">以下是本次采样中各规则最密集的一段，并非完整发言历史。</p>' +
+      groups.map(function (group) {
+        var w = group.window;
+        return '<section class="zvi-window"><b>' + esc(group.labels.join(' / ')) + '：' + w.count + ' 条</b>' +
+          '<div class="zvi-proof-note">' + esc(timeWithSeconds(w.start)) + ' — ' + esc(timeWithSeconds(w.end)) +
+          ' · 跨度 ' + esc(durationText(w.end - w.start)) + '</div><ol class="zvi-proof-list">' +
+          w.items.map(function (it, index) {
+            var gap = index ? '距上一条 ' + durationText(it.ts - w.items[index - 1].ts) : '本组首条';
+            return '<li><div class="zvi-proof-time">' + esc(timeWithSeconds(it.ts)) + ' · ' + esc(gap) +
+              '</div><a href="' + esc(it.url || '#') + '" target="_blank" rel="noopener">' + esc(it.title) +
+              '</a><span class="zvi-proof-note"> · ' + (it.kind === 'art' ? '文章' : '回答') + ' · ' +
+              (it.approx ? '≈' : '') + it.len + ' 字</span>' +
+              (it.snip ? '<p class="zvi-snip">' + esc(it.snip) + '</p>' : '') + '</li>';
+          }).join('') + '</ol></section>';
+      }).join('') + '</details>';
+  }
+
+  function pageAuthors() {
+    var authors = new Map();
+    cardStates.forEach(function (state, root) {
+      if (!validCard(root, state)) {
+        restoreCard(root);
+        if (state.panel) state.panel.remove();
+        root.removeAttribute('data-zvi');
+        root.removeAttribute('data-zvi-card');
+        cardStates.delete(root);
+        return;
+      }
+      var entry = authors.get(state.token);
+      if (!entry) {
+        entry = { token: state.token, data: state.data, verdict: evaluate(state.data), count: 0, blocked: 0 };
+        authors.set(state.token, entry);
+      }
+      entry.count++;
+      if (root.classList.contains('zvi-hidden') || root.classList.contains('zvi-collapsed')) entry.blocked++;
+    });
+    return Array.from(authors.values());
+  }
+
+  function updateAuthors(authors) {
+    if (!panel) return;
+    var list = panel.querySelector('[data-zvi-authors]');
+    if (!list) return;
+    var entries = authors.filter(function (entry) {
+      return entry.verdict.frequent || entry.blocked || cfg.blocklist.indexOf(entry.token) >= 0;
+    });
+    var html = entries.length ? entries.map(function (entry) {
+      var token = entry.token;
+      var status = entry.blocked ? '已折叠/隐藏 ' + entry.blocked + ' 条' : '本页 ' + entry.count + ' 条';
+      return '<details class="zvi-author-entry" data-zvi-owner="' + esc(token) + '" data-evidence-key="' + esc(token) + '">' +
+        '<summary><b>' + esc(entry.data.profile.name || token) + '</b><span>' + esc(status) + '</span></summary>' +
+        '<p class="zvi-proof-note">' + esc(entry.verdict.reasons.join('；') || '手动屏蔽') + '</p>' +
+        renderBurstEvidence(entry.data, entry.verdict, token) +
+        '<div class="zvi-author-actions"><button type="button" data-zvi-act="unfold">显示此人回答</button>' +
+        '<button type="button" data-zvi-act="wl">' + (cfg.whitelist.indexOf(token) >= 0 ? '已在白名单' : '不再屏蔽') + '</button>' +
+        (cfg.blocklist.indexOf(token) >= 0 ? '<button type="button" data-zvi-act="block">取消手动屏蔽</button>' : '') +
+        '</div></details>';
+    }).join('') : '<p class="hint">暂未发现高频作者。浏览更多回答后会自动更新；只统计本页已读取的作者。</p>';
+    if (list._zviHtml === html) return;
+    var open = new Set([].slice.call(list.querySelectorAll('details[open]')).map(function (el) { return el.getAttribute('data-evidence-key'); }));
+    list.innerHTML = html;
+    list._zviHtml = html;
+    list.querySelectorAll('details').forEach(function (el) { el.open = open.has(el.getAttribute('data-evidence-key')); });
+  }
 
   function renderInline(anchor, token, data) {
     var s = data.stats, p = data.profile || {};
@@ -890,13 +1060,14 @@
     var panel = document.createElement('div');
     panel.className = 'zvi-inline' + (verdict.hit ? ' is-warn' : '');
     panel.setAttribute('data-zvi-inline', token);
+    panel.setAttribute('data-zvi-owner', token);
 
     var sep = '<span class="zvi-sep">\u00b7</span>';
     var main = [
-      '\u8fd1 7 \u5929 <b>' + s.d7 + '</b> \u6761',
+      '样本内近 7 天 <b>' + s.d7 + '</b> 条',
       '30 \u5929 <b>' + s.d30 + '</b> \u6761',
       '\u95f4\u9694 <b>' + esc(s.avgGapText) + '</b>',
-      '\u5747 <b>' + s.avgLen + '</b> \u5b57'
+      '均 <b>' + (s.lengthReliable ? '' : '≈') + s.avgLen + '</b> 字'
     ].join(sep);
 
     var chips = verdict.reasons.map(function (r) {
@@ -923,6 +1094,7 @@
     }).join('');
 
     var foot = ['\u6837\u672c ' + s.totalFetched + ' \u6761'];
+    if (data.partial) foot.push('接口受限，仅展示已核对作者的部分记录');
     if (s.lastTime) foot.push('\u6700\u65b0 ' + s.lastTime);
     if (s.medLen) foot.push('\u4e2d\u4f4d ' + s.medLen + ' \u5b57');
     if (s.maxLen) foot.push('\u6700\u957f ' + s.maxLen);
@@ -935,7 +1107,7 @@
       '<span class="zvi-act">' +
       '<button class="zvi-lnk" data-zvi-act="detail">\u6700\u8fd1 ' + s.recent.length + ' \u6761 \u25be</button>' +
       '</span>' +
-      '</div>' +
+      '</div>' + renderBurstEvidence(data, verdict, token) +
       '<div class="zvi-detail"><ul>' +
       (detail || '<li class="zvi-meta">\u6682\u65e0\u53d1\u8a00\u8bb0\u5f55</li>') + '</ul>' +
       '<div class="zvi-note"><span>' + esc(foot.join(' \u00b7 ')) + '</span>' +
@@ -945,6 +1117,9 @@
       '</div>';
 
     if (!mount(anchor, panel)) return;
+    var root = locate(anchor).item;
+    root.setAttribute('data-zvi-card', '');
+    cardStates.set(root, { token: token, anchor: anchor, panel: panel, data: data });
     applyAction(token, verdict);
     maybeAI(panel, token, data, verdict);
   }
@@ -1007,12 +1182,7 @@
     return !!(a.closest && a.closest('.RichText, .RichContent, .Post-RichText, .ContentItem-actions, .AnswerItem-actions, .RichItem-actions'));
   }
 
-  /**
-   * 一张卡片只认一个作者。
-   * 知乎卡片里同一作者会同时挂头像链接和昵称链接（甚至还有正文里 @ 的、推荐关注的），
-   * 逐个 anchor 标注就会在同一张卡片下生成两三条面板。
-   * 取「正文块之前、DOM 顺序最后一个」——那通常就是紧贴正文的作者行。
-   */
+  /** 一张卡片只认一个明确作者：优先作者行；有多个无法区分的账号时跳过。 */
   function pickAuthor(root, list) {
     if (!list.length) return null;
     var content = root.querySelector(CONTENT_SEL);
@@ -1021,70 +1191,84 @@
       // 2 = DOCUMENT_POSITION_PRECEDING，即该链接在正文块之前
       if (content && (content.compareDocumentPosition(list[i].a) & 2)) before.push(list[i]);
     }
-    if (before.length) return before[before.length - 1];
-    return list[0];
+    var authors = before.filter(function (entry) {
+      return !!entry.a.closest('.AuthorInfo, .Post-Author, .ArticleItem-authorInfo, [itemprop="author"]');
+    });
+    if (authors.length) before = authors;
+    // 没有明确作者行时，只接受唯一账号；不把“谁赞同了”或推荐关注误当作者。
+    var tokens = new Set(before.map(function (entry) { return entry.token; }));
+    return tokens.size === 1 ? before[before.length - 1] : null;
   }
 
   /** 兜底：同一张卡片内若已有多条面板，只保留 DOM 顺序最靠前的那条 */
   function dedupePanels() {
-    var panels = [].slice.call(document.querySelectorAll('.zvi-inline'));
-    if (panels.length < 2) return;
-    var keep = [];
-    panels.forEach(function (p) {
-      var root = (p.closest && p.closest(ITEM_SEL)) || p.parentElement;
-      for (var i = 0; i < keep.length; i++) {
-        var q = keep[i];
-        var qroot = (q.closest && q.closest(ITEM_SEL)) || q.parentElement;
-        if (qroot === root || (qroot && qroot.contains(p)) || (root && root.contains(q))) {
-          p.remove();
-          return;
-        }
-      }
-      keep.push(p);
+    cardStates.forEach(function (state, root) {
+      root.querySelectorAll('.zvi-inline').forEach(function (p) {
+        if (p !== state.panel) p.remove();
+      });
     });
   }
 
-  var scanBusy = false;
+  var scanBusy = false, scanAgain = false;
   function scan() {
-    if (cfg.mode !== 'inline' || scanBusy) return;
+    if (cfg.mode !== 'inline') return;
+    if (scanBusy) { scanAgain = true; return; }
+    pageAuthors(); // 清理已离开页面或被 React 复用的卡片
     var anchors = document.querySelectorAll('a[href*="/people/"]');
-    var groups = [];
+    var groups = new Map();
     for (var i = 0; i < anchors.length; i++) {
       var a = anchors[i];
       if (notAuthorLink(a)) continue;
       var token = tokenFromHref(a.getAttribute('href') || a.href);
       if (!token) continue;
-      var root = (a.closest ? a.closest(ITEM_SEL) : null) || locate(a).item;
+      var root = locate(a).item;
       if (!root) continue;
-      if (root.getAttribute('data-zvi') || root.querySelector('.zvi-inline')) continue;
-      var g = null;
-      for (var k = 0; k < groups.length; k++) { if (groups[k].root === root) { g = groups[k]; break; } }
-      if (!g) { g = { root: root, list: [] }; groups.push(g); }
+      var g = groups.get(root);
+      if (!g) { g = { root: root, list: [] }; groups.set(root, g); }
       g.list.push({ a: a, token: token });
     }
 
-    var queue = [];
-    for (var j = 0; j < groups.length && queue.length < cfg.maxPerPage; j++) {
-      var pick = pickAuthor(groups[j].root, groups[j].list);
-      if (!pick || pending.has(pick.token)) continue;
-      groups[j].root.setAttribute('data-zvi', pick.token);
-      queue.push({ anchor: pick.a, item: groups[j].root, token: pick.token });
-    }
+    var queue = [], more = false;
+    groups.forEach(function (g) {
+      var pick = pickAuthor(g.root, g.list);
+      if (!pick) return;
+      if (g.root.getAttribute('data-zvi') === pick.token && g.root.querySelector('.zvi-inline')) return;
+      if (queue.length >= cfg.maxPerPage) { more = true; return; }
+      g.root.querySelectorAll('.zvi-inline').forEach(function (n) { n.remove(); });
+      g.root.setAttribute('data-zvi', pick.token);
+      queue.push({ anchor: pick.a, item: g.root, token: pick.token });
+    });
     if (!queue.length) { dedupePanels(); return; }
 
     scanBusy = true;
-    var idx = 0;
+    scanAgain = false;
+    var idx = 0, generation = scanGeneration;
     function next() {
-      if (idx >= queue.length) { scanBusy = false; dedupePanels(); return; }
+      if (generation !== scanGeneration || cfg.mode !== 'inline' || idx >= queue.length) return Promise.resolve();
       var job = queue[idx++];
-      getData(job.token).then(function (d) {
+      return getData(job.token).then(function (d) {
+        if (generation !== scanGeneration || cfg.mode !== 'inline' ||
+          locate(job.anchor).item !== job.item || !job.item.isConnected ||
+          tokenFromHref(job.anchor.getAttribute('href')) !== job.token) return;
         if (d.error) { renderError(job.anchor, job.token, d.error); }
         else if (!d.stats || !d.stats.totalFetched) { renderError(job.anchor, job.token, '\u672a\u83b7\u53d6\u5230\u53d1\u8a00\u8bb0\u5f55'); }
         else { renderInline(job.anchor, job.token, d); }
-      }).then(function () { setTimeout(next, 220); });
+      }).catch(function (err) { console.warn('[ZVI] card error', err); })
+        .then(function () {
+          if (generation !== scanGeneration) return;
+          return new Promise(function (resolve) { setTimeout(resolve, 220); }).then(next);
+        });
     }
     var start = Math.min(4, queue.length);
-    for (var k2 = 0; k2 < start; k2++) next();
+    var workers = [];
+    for (var k2 = 0; k2 < start; k2++) workers.push(next());
+    Promise.all(workers).finally(function () {
+      if (generation !== scanGeneration) return;
+      scanBusy = false;
+      dedupePanels();
+      updateFab();
+      if (more || scanAgain) scheduleScan(220);
+    });
   }
 
   /* ==================== 设置面板 ==================== */
@@ -1093,13 +1277,19 @@
 
   function updateFab() {
     if (!fab) return;
-    var n = document.querySelectorAll('.zvi-collapsed, .zvi-hidden').length;
-    fab.innerHTML = '<span>\u53d1\u8a00\u753b\u50cf</span>' + (n ? '<span class="zvi-n">' + n + '</span>' : '');
+    var authors = pageAuthors();
+    var n = authors.filter(function (entry) { return entry.verdict.frequent; }).length;
+    var blocked = authors.reduce(function (sum, entry) { return sum + entry.blocked; }, 0);
+    var html = '<span>发言画像</span>' + (n ? '<span class="zvi-n">高频 ' + n + ' 人</span>' : '') +
+      (blocked ? '<span>已折叠/隐藏 ' + blocked + ' 条</span>' : '');
+    if (fab.innerHTML !== html) fab.innerHTML = html;
+    updateAuthors(authors);
   }
 
   function buildFab() {
     if (fab) return;
-    fab = document.createElement('div');
+    fab = document.createElement('button');
+    fab.type = 'button';
     fab.id = 'zvi-fab';
     fab.innerHTML = '<span>\u53d1\u8a00\u753b\u50cf</span>';
     fab.addEventListener('click', function () { togglePanel(); });
@@ -1116,7 +1306,9 @@
     panel = document.createElement('div');
     panel.id = 'zvi-panel';
     panel.innerHTML =
-      '<h3>\u77e5\u4e69\u53d1\u8a00\u753b\u50cf \u00b7 \u8bbe\u7f6e</h3>' +
+      '<h3>本页高频与屏蔽名单</h3><div data-zvi-authors></div>' +
+      '<div class="row"><button type="button" data-zvi-act="showall">恢复本页全部回答</button></div>' +
+      '<h3 class="grp">发言画像 · 设置</h3>' +
       '<div class="row"><label>\u5c55\u793a\u65b9\u5f0f</label><select data-k="mode">' +
       opt('inline', '\u5934\u50cf\u4e0b\u65b9\u5185\u8054', cfg.mode) +
       opt('hover', '\u60ac\u505c\u5361\u7247', cfg.mode) +
@@ -1175,6 +1367,7 @@
 
     document.body.appendChild(panel);
     bindPanel();
+    updateAuthors(pageAuthors());
   }
 
   function opt(v, label, cur) {
@@ -1186,6 +1379,12 @@
     panel.querySelectorAll('[data-k]').forEach(function (el) {
       var k = el.getAttribute('data-k');
       var v = el.type === 'checkbox' ? el.checked : (el.type === 'number' ? Number(el.value) : el.value);
+      if (el.type === 'number') {
+        if (!isFinite(v)) return;
+        if (el.min !== '') v = Math.max(Number(el.min), v);
+        if (el.max !== '') v = Math.min(Number(el.max), v);
+        el.value = v;
+      }
       if (k.indexOf('burst.') === 0) cfg.burst[k.slice(6)] = v;
       else if (k.indexOf('llm.') === 0) cfg.llm[k.slice(4)] = v;
       else cfg[k] = v;
@@ -1194,13 +1393,19 @@
   }
 
   function rescan() {
+    scanGeneration++;
+    scanBusy = false;
+    scanAgain = false;
+    clearTimeout(scanTimer);
+    scanTimer = null;
+    hideCard();
     document.querySelectorAll('.zvi-inline, .zvi-bar').forEach(function (n) { n.remove(); });
     document.querySelectorAll('[data-zvi]').forEach(function (n) { n.removeAttribute('data-zvi'); });
     document.querySelectorAll('.zvi-collapsed').forEach(function (n) { n.classList.remove('zvi-collapsed'); });
     document.querySelectorAll('.zvi-hidden').forEach(function (n) { n.classList.remove('zvi-hidden'); });
     document.querySelectorAll('.zvi-marked').forEach(function (n) { n.classList.remove('zvi-marked'); });
-    pending.clear();
-    blockedCount = 0;
+    document.querySelectorAll('[data-zvi-card]').forEach(function (n) { n.removeAttribute('data-zvi-card'); });
+    cardStates.clear();
     scan();
     updateFab();
   }
@@ -1244,12 +1449,20 @@
   /* ==================== 事件 ==================== */
 
   function onClick(e) {
-    var t = e.target;
+    var t = e.target && e.target.closest ? e.target.closest('[data-zvi-act]') : null;
     if (!t || !t.getAttribute) return;
     var act = t.getAttribute('data-zvi-act');
     if (!act) return;
-    var host = t.closest ? t.closest('[data-zvi-inline]') : null;
-    var token = host ? host.getAttribute('data-zvi-inline') : null;
+    var host = t.closest('[data-zvi-owner]');
+    var token = host ? host.getAttribute('data-zvi-owner') : null;
+    e.preventDefault();
+    e.stopPropagation();
+
+    if (act === 'showall') {
+      cardStates.forEach(function (state, root) { shownTokens.add(state.token); restoreCard(root); });
+      updateFab();
+      return;
+    }
 
     if (act === 'detail') {
       if (!host) return;
@@ -1260,20 +1473,28 @@
     }
     if (act === 'block' && token) {
       var i = cfg.blocklist.indexOf(token);
-      if (i >= 0) cfg.blocklist.splice(i, 1); else cfg.blocklist.push(token);
+      if (i >= 0) { cfg.blocklist.splice(i, 1); shownTokens.add(token); }
+      else {
+        cfg.blocklist.push(token);
+        shownTokens.delete(token);
+        cfg.whitelist = cfg.whitelist.filter(function (v) { return v !== token; });
+      }
       persistCfg();
       rescan();
       return;
     }
     if (act === 'wl' && token) {
       if (cfg.whitelist.indexOf(token) < 0) cfg.whitelist.push(token);
+      cfg.blocklist = cfg.blocklist.filter(function (v) { return v !== token; });
+      shownTokens.add(token);
       persistCfg();
-      rescan();
+      cardStates.forEach(function (state, root) { if (state.token === token) restoreCard(root); });
+      updateFab();
       return;
     }
-    if (act === 'unfold') {
-      var c = t.closest ? t.closest('.zvi-collapsed') : null;
-      if (c) { c.classList.remove('zvi-collapsed'); var bar = c.querySelector('.zvi-bar'); if (bar) bar.remove(); }
+    if (act === 'unfold' && token) {
+      shownTokens.add(token);
+      cardStates.forEach(function (state, root) { if (state.token === token) restoreCard(root); });
       updateFab();
     }
   }
@@ -1294,20 +1515,26 @@
     card.addEventListener('mouseleave', function () { hideTimer = setTimeout(hideCard, 260); });
     return card;
   }
-  function hideCard() { clearTimeout(showTimer); if (card) card.style.opacity = '0'; }
+  function hideCard() {
+    clearTimeout(showTimer);
+    anchorEl = null;
+    if (card) { card.style.opacity = '0'; card.style.pointerEvents = 'none'; }
+  }
   function showHover(el, token) {
     ensureCard();
     anchorEl = el;
     cardBody.textContent = '\u6b63\u5728\u8bfb\u53d6\u2026';
     card.style.opacity = '1';
+    card.style.pointerEvents = 'auto';
     var r = el.getBoundingClientRect();
     card.style.left = Math.max(12, Math.min(r.left, window.innerWidth - 412)) + 'px';
     card.style.top = (r.bottom + 8) + 'px';
     getData(token).then(function (d) {
+      if (anchorEl !== el || cfg.mode !== 'hover' || !el.isConnected) return;
       if (!d || d.error) { cardBody.textContent = d && d.error ? d.error : '\u672a\u83b7\u53d6\u5230\u6570\u636e'; return; }
       var s = d.stats, v = evaluate(d);
       cardBody.innerHTML = '<div style="font-weight:600;color:#14448c">' + esc(d.profile.name || token) + '</div>' +
-        '<div style="margin:6px 0;color:#555">\u8fd17\u5929 <b>' + s.d7 + '</b> \u6761 \u00b7 \u8fd130\u5929 <b>' + s.d30 +
+        '<div style="margin:6px 0;color:#555">样本内近7天 <b>' + s.d7 + '</b> 条 · 近30天 <b>' + s.d30 +
         '</b> \u6761 \u00b7 \u95f4\u9694 <b>' + esc(s.avgGapText) + '</b> \u00b7 \u5747 <b>' + s.avgLen + '</b> \u5b57</div>' +
         (v.hit ? '<div style="color:#d4380d;margin-bottom:6px">' + esc(v.reasons.join('\uff1b')) + '</div>' : '') +
         '<ul style="list-style:none;margin:0;padding:0">' + s.recent.map(function (it) {
@@ -1315,7 +1542,7 @@
             '<a style="color:#14448c;text-decoration:none" href="' + esc(it.url || '#') + '" target="_blank" rel="noopener">' + esc(it.title) + '</a> ' +
             '<span style="color:#d4380d;font-size:11px">' + (it.approx ? '\u2248' : '') + it.len + '\u5b57</span>' +
             '<div style="color:#999;font-size:11px">' + esc(fmtShort(it.ts)) + '</div></li>';
-        }).join('') + '</ul>';
+        }).join('') + '</ul>' + renderBurstEvidence(d, v, token);
       var r2 = el.getBoundingClientRect();
       card.style.top = (r2.bottom + 8) + 'px';
     });
@@ -1342,8 +1569,9 @@
 
   var scanTimer = null;
   function scheduleScan(delay) {
-    clearTimeout(scanTimer);
+    if (scanTimer !== null || cfg.mode !== 'inline') return;
     scanTimer = setTimeout(function () {
+      scanTimer = null;
       try { scan(); } catch (err) { console.warn('[ZVI] scan error', err); }
       updateFab();
     }, delay || 1200);
@@ -1378,10 +1606,22 @@
     document.addEventListener('click', onClick, true);
     window.addEventListener('scroll', function () { if (cfg.mode === 'hover') hideCard(); }, true);
 
-    var mo = new MutationObserver(function () {
-      if (cfg.mode === 'inline') scheduleScan(1200);
+    var ownedSelector = '.zvi-inline, .zvi-bar, #zvi-panel, #zvi-fab';
+    function owned(node) {
+      var el = node.nodeType === 1 ? node : node.parentElement;
+      return !!(el && el.closest && el.closest(ownedSelector));
+    }
+    var mo = new MutationObserver(function (records) {
+      if (cfg.mode !== 'inline') return;
+      var changed = records.some(function (record) {
+        if (owned(record.target)) return false;
+        if (record.type === 'attributes') return true;
+        var nodes = [].slice.call(record.addedNodes).concat([].slice.call(record.removedNodes));
+        return nodes.some(function (node) { return !owned(node); });
+      });
+      if (changed) scheduleScan(500);
     });
-    mo.observe(document.documentElement || document.body, { childList: true, subtree: true });
+    mo.observe(document.documentElement || document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['href'] });
 
     buildFab();
     registerMenus();
